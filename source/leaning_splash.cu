@@ -157,6 +157,7 @@ __global__ void build_mask_kernel(
     int nQB,                                                   // Number of query blocks
     int nKB                                                    // Number of key blocks
 ){
+    //test
     // === THREAD AND BLOCK INDEXING ===
     // Each thread processes one query; blockIdx and threadIdx are built-in CUDA variables
     int q = blockIdx.x*BLOCK_M + threadIdx.x;                 // Global query index: block_id * block_size + thread_in_block
