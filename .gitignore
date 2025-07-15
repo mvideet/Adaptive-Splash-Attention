@@ -1,0 +1,12 @@
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+build/
+dist/
+*.egg-info/
+.vscode/
+*.so
+*.pdf
