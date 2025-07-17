@@ -77,23 +77,6 @@ K_idx = torch.arange(seq_len, device='cuda').unsqueeze(0).unsqueeze(0).expand(ba
 output = attention(Q, K, V, Q_idx, K_idx)
 ```
 
-### Running Benchmarks
-
-```bash
-# Run performance benchmarks
-python benchmark/bench.py
-
-# Or explore the interactive notebook
-jupyter notebook benchmark/attention_benchmarks.ipynb
-```
-
-### Testing
-
-```bash
-# Run basic functionality tests
-python test_splash.py
-```
-
 ## Project Structure
 
 ```
@@ -146,26 +129,9 @@ splash_attention/
 - **Sequence Length**: Optimized for sequences up to 4K tokens
 - **Precision**: Currently supports FP32 only
 
-## Contributing
-
-This is a learning project, but contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
 
 ## References
 
 - [FlashAttention](https://arxiv.org/abs/2205.14135) - Efficient attention computation
 - [α-entmax](https://arxiv.org/abs/1905.05702) - Sparse attention normalization
 - [Sparse Transformers](https://arxiv.org/abs/1904.10509) - Sparse attention patterns
-
-## License
-
-See LICENSE file for details.
-
-## Acknowledgments
-
-Built for learning purposes to understand modern attention mechanisms and CUDA optimization techniques.
