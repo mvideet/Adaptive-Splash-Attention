@@ -77,6 +77,7 @@ K_idx = torch.arange(seq_len, device='cuda').unsqueeze(0).unsqueeze(0).expand(ba
 output = attention(Q, K, V, Q_idx, K_idx)
 ```
 
+
 ## Project Structure
 
 ```
@@ -95,16 +96,33 @@ splash_attention/
 ```
 
 ## Algorithm Details
-
 ### Sparse Attention Mechanism
 
-1. **Top-K Selection**: For each query, compute attention scores with all keys and keep only the top-K highest scores
+1. **Top-K Selection**: For each query, compute attention scores with all keys and keep only the top-K highest scores. The scores are computed as scaled dot products between query and key vectors. Only the K highest scoring key-value pairs are kept for each query position.
+
 2. **α-entmax Normalization**: Apply α-entmax instead of softmax for controllable sparsity:
    ```
    p_i = max(0, ((α-1)s_i - τ)^(1/(α-1)))
    ```
-3. **Block-Sparse Computation**: Organize computation in tiles to maximize GPU memory bandwidth
-4. **Causal Masking**: Ensure autoregressive property by masking future positions
+   Where s_i are the attention scores, τ is a learned threshold, and α controls sparsity (α=1 recovers softmax, α>1 increases sparsity). This allows the model to automatically learn which connections to drop.
+
+3. **Block-Sparse Computation**: The SplashAttention implementation organizes computation in tiles/blocks to maximize GPU memory bandwidth:
+   - Query vectors are processed in blocks of size BLOCK_M
+   - Key vectors are processed in blocks of size BLOCK_N  
+   - Each thread computes attention for one query position
+   - Shared memory is used to cache key/value blocks
+   - Only blocks containing top-K elements are processed
+
+4. **Causal Masking**: Ensure autoregressive property by masking future positions:
+   - Each query position can only attend to key positions up to its own position
+   - Position indices Q_idx and K_idx are used to implement the causal mask
+   - Invalid attention scores are set to negative infinity before top-K selection
+
+5. **Splash Pattern**: The block-sparse attention creates a "splash" pattern where:
+   - Each query attends strongly to a small set of relevant keys (via top-K)
+   - These connections form localized clusters or "splashes" of attention
+   - The pattern adapts dynamically based on content rather than being fixed
+   - Memory access is optimized by processing blocks with active connections
 
 ### Performance Characteristics
 
