@@ -149,7 +149,7 @@ splash_attention/
 
 
 ## References
-
+- [Adaptive Sparse Flash Attention](https://arxiv.org/pdf/2502.12082) - AdaSplashAttention
 - [FlashAttention](https://arxiv.org/abs/2205.14135) - Efficient attention computation
 - [α-entmax](https://arxiv.org/abs/1905.05702) - Sparse attention normalization
 - [Sparse Transformers](https://arxiv.org/abs/1904.10509) - Sparse attention patterns

@@ -355,8 +355,8 @@ __global__ void build_lookup_kernel(
 
 // === CUDA KERNEL: SPARSE ATTENTION FORWARD PASS ===
 __global__ void splash_forward_sparse(
-    const float* Q, const float* K, const float* V,          // Input tensors
-    const int* Q_idx, const int* K_idx,                      // Position indices
+    const float* Q, const float* K, const float* V,          // Query, Key and Value tensors for attention computation
+    const int* Q_idx, const int* K_idx,                      // Position indices [B*H, NQ] and [B*H, NK] for causal masking
     const float* taus,                                        // Entmax thresholds from mask kernel
     const int* Qi_ptr, const int* Qi_idx,                    // Lookup tables from build_lookup_kernel
     float* Out,                                               // Output tensor [B*H, NQ, d]
@@ -389,8 +389,12 @@ __global__ void splash_forward_sparse(
     #pragma unroll for(int t=0; t<d; ++t)                    // Initialize to zero
         accum[t] = 0.f;
     float norm = 0.f;                                         // Normalization factor
-    
     // === LOOKUP TABLE INDEXING ===
+    // Calculate indices into the sparse lookup tables:
+    // - iQB: Maps the global query index q to its block index by integer division with BLOCK_M
+    // - off: Computes offset into Qi_ptr array for this batch+head and query block
+    //        The +1 in nQB+1 accounts for the extra entry in CSR format
+    // - offI: Base offset into Qi_idx array for this batch+head's sparse indices
     int iQB = q / BLOCK_M;                                    // Query block index
     int off = bh*(nQB+1) + iQB;                              // Offset into Qi_ptr
     int offI= bh*(nQB*nKB);                                  // Offset into Qi_idx
@@ -437,9 +441,9 @@ __global__ void splash_forward_sparse(
             #pragma unroll for(int t=0; t<d; ++t)            // For each dimension
                 accum[t] += p * Vtile[k*d + t];              // output += p * value
         }
-        __syncthreads();                                      // Synchronize before next tile
+        __syncthreads();                      
+                        // Synchronize before next tile
     }
-    
     // === NORMALIZE AND WRITE OUTPUT ===
     float invN = 1.f / (norm + EPS);                         // Inverse normalization (avoid division by zero)
     float* OutPtr = Out + ((bh*NQ + q)*d);                   // Output pointer for this query

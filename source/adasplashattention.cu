@@ -136,7 +136,10 @@ __global__ void build_mask_kernel(
         int idx = bh*NQ+q;
         int seq_q = Q_idx[idx]; //global seq position of this query
         float q_reg[D_MAX]; //we will store the query vector that is D_head size 
-        
+        // Load query vector into registers for fast access
+        // Q is a 1D array representing [B*H, NQ, d] tensor
+        // idx*d points to start of this query's vector
+        // Unroll loop for better performance
         #pragma unroll
         for(int t=0;t<d;++t)
             q_reg[t] = Q[idx*d+t];
@@ -283,7 +286,137 @@ __global__ void build_lookup_kernel(const int8_t* M, int B, int H, int nQB, int 
             }
         }
     }
-    //
+    __global__ void splash_forward_sparse(
+        const float* Q, const float* K, const float* V,          // Query, Key and Value tensors for attention computation
+        const int* Q_idx, const int* K_idx,                      // Position indices [B*H, NQ] and [B*H, NK] for causal masking
+        const float* taus,                                        // Entmax thresholds from mask kernel
+        const int* Qi_ptr, const int* Qi_idx,                    // Lookup tables from build_lookup_kernel
+        float* Out,                                               // Output tensor [B*H, NQ, d]
+        int B, int H, int NQ, int NK, int d,                     // Tensor dimensions
+        float alpha, float sm_scale,                             // Attention parameters
+        int nQB, int nKB                                         // Number of blocks
+    ){
+
+    // Calculate global query index for a certain batch*head
+    // - blockIdx.x * BLOCK_M: Offset to start of current thread block's queries
+    // - threadIdx.x: Thread's position within block (0 to BLOCK_M-1)
+    // This distributes queries across thread blocks and threads
+    int q = blockIdx.x*BLOCK_M + threadIdx.x;
+
+    // Get batch*head index from block's y-coordinate
+    // Each block processes queries for one batch item and attention head
+    int bh = blockIdx.y;
+
+    // Exit if query index exceeds total number of queries
+    if(q>=NQ) return;
+
+    // Get sequence position for this query to enforce causal masking
+    // Q_idx maps from query index to sequence position
+    // bh*NQ + q: Offset into Q_idx array for this batch+head and query
+    // We need sequence positions to ensure queries only attend to keys
+    // at positions up to their own position (causal masking)
+    int seq_q = Q_idx[bh*NQ + q];
+    float tau = taus[bh*NQ + q];
+    //create a pointer to the query vector that we are interseted 
+    const float* Qptr = Q + ((bh*NQ + q)*d);
+
+    //load the query into the registers
+    float qreg[D_MAX];
+    #pragma unroll
+    for(int t=0;t<d;++t)
+        qreg[t] = Qptr[t];
+    
+   //Get the shared memory set up for the keys and values
+   extern __shared__ float sh[];
+   float* Ktile = sh;
+   // Point Vtile to second half of shared memory buffer, after the Ktile section
+   // BLOCK_N * d bytes are allocated for Ktile, so Vtile starts after that offset
+   float* Vtile = sh + BLOCK_N * d;
+
+   //initialize the accumulator
+   float accum[D_MAX];
+   #pragma unroll
+   for(int t=0;t<d;++t)
+    accum[t] = 0.f;
 
 
+    //iQB mapes the global query index q to its block index by div
+    //off computes offset in the Qi_ptr array for the batch heads and query block
+    //offI computes the offset into Qi_idx array
+    int iQB = q/BLOCK_M;
+    int offset = bh*(nQB+1) + iQB;
+    int offsetI = bh*(nQB*nKB);
+    // Process active key blocks that were marked as needed in the mask
+    // Qi_ptr[offset] and Qi_ptr[offset+1] define the range of active key blocks for this query block
+    // This implements sparse attention by only processing key blocks that passed the mask threshold
+    for (int ptr = Qi_ptr[offset]; ptr < Qi_ptr[offset+1]; ptr++){ 
+        // ptr indexes into Qi_idx array which stores indices of active key blocks
+        // offsetI + ptr gives the actual position in Qi_idx for this batch/head
+        int jKB = Qi_idx[offsetI + ptr]; // Which block of keys are we processing
+        
+        // Calculate starting position of this key block
+        // Each block contains BLOCK_N keys, so multiply block index by BLOCK_N
+        // BLOCK_N (64) is the number of keys processed per tile/block
+        // Calculate starting key index for this block by multiplying block index (jKB) by block size
+        int start = jKB * BLOCK_N; // e.g. block 0 starts at 0, block 1 starts at 64, block 2 at 128, etc.
+        
+        // Get thread ID within the block for parallel processing
+        int tid = threadIdx.x; //each thread works on BLOCK_M elements
+        
+        // Cooperatively load the key block into shared memory
+        // Each thread loads elements spaced BLOCK_M apart, e.g. thread 0 loads elements 0,32,64,...
+        // thread 1 loads elements 1,33,65,... etc. This distributes the work evenly across threads
+        // This distributes the work of loading BLOCK_N*d elements across BLOCK_M threads
+        for(int x = tid; x < BLOCK_N*d; x += BLOCK_M){
+            // Convert flat index x into key and dimension indices:
+            int col = x/d;  // Which key in the block (0 to BLOCK_N-1)
+            int dim = x%d;  // Which dimension of the key vector (0 to d-1)
+            int kn = start + col; //global key index within the batch/head
+            bool ok = (kn<NK && K_idx[bh*NK+kn]<=seq_q); //check if the key is within bounds and causal
+            Ktile[x] = ok ? K[(bh*NK+kn)*d+dim] : 0.f; //load the key or zero if out of bounds/causal
+            Vtile[x] = ok ? V[(bh*NK+kn)*d+dim] : 0.f; //load the value or zero if out of bounds/causal
+        }
+        __syncthreads(); //wait for all threads to finish loading before proceeding
+
+        //compute attention for this tile
+        for(int k = 0;k<BLOCK_N;++k){
+            int kn = start + k; //global key index within the batch/head
+            if(kn>=NK || K_idx[bh*NK+kn]>seq_q) continue; //skip if out of bounds or violates causality
+            float s = 0.f;
+            #pragma unroll
+            for(int t=0;t<d;++t){
+                s+=qreg[t]*Ktile[k*d+t];
+            }
+            s*=sm_scale;
+            float u = (alpha-1.f)*s - tau; //compute u_j = (α-1)s_j - τ
+            float p = (u>0)?powf(u, 1.f/(alpha-1.f)):0.f; //compute probability
+            norm += p; //accumulate normalization
+            #pragma unroll
+            for(int t=0;t<d;++t){
+                accum[t] += p*Vtile[k*d+t];
+            }
+        }
+        __syncthreads();
+  
 }
+
+// Compute inverse normalization factor, adding small epsilon to avoid division by zero
+float invN = 1.f/(norm+EPS); 
+
+// Get pointer to output location for this query:
+// - bh*NQ*d: offset to start of this batch+head
+// - q*d: offset to this query position
+// - Total offset: ((bh*NQ + q)*d) elements from start of Out
+float* OutPtr = Out + ((bh*NQ + q)*d);
+
+// Unroll loop for better performance
+#pragma unroll
+for(int t=0;t<d;++t){
+    // For each dimension:
+    // - accum[t] contains weighted sum of values
+    // - Multiply by invN to get normalized attention output
+    // - Store result in output tensor
+    OutPtr[t] = accum[t]*invN;
+}
+    }
+
