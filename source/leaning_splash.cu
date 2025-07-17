@@ -20,7 +20,9 @@
 #define D_MAX 128             // Maximum head dimension supported
 #endif
 #ifndef K_KEEP
-#define K_KEEP 8              // Number of top-K attention scores to keep per query
+#define K_KEEP 8              // Number of top-K attention scores to keep per query. This controls sparsity by only keeping
+                             // the K highest attention scores for each query, making the attention mechanism more efficient
+                             // while still maintaining good performance. A higher value means more dense attention.
 #endif
 
 #define EPS 1e-6f             // Small epsilon to prevent division by zero
@@ -37,27 +39,40 @@
 // === COMPILE-TIME SAFETY ASSERTIONS ===
 // These static_assert statements check constraints at compile time
 static_assert(BLOCK_N > 0 && BLOCK_M > 0, "Block dimensions must be positive");
+// This assertion ensures we don't exceed the shared memory limits per thread block
+// Each key tile needs BLOCK_N * D_MAX floats (4 bytes each), which must fit in shared memory
+// Most GPUs have 48KB shared memory per block, but we conservatively check against 8KB
+// Exceeding this would cause kernel launch failures
 static_assert(BLOCK_N * D_MAX <= 8192, "Shared memory K tile too large (max ~8KB per tile)");
 static_assert(2 * BLOCK_N * D_MAX <= 32768, "Shared memory K+V tiles too large (max ~32KB total)");
 static_assert(BLOCK_M <= 1024, "BLOCK_M exceeds typical max threads per block");
 static_assert(K_KEEP <= BLOCK_N, "K_KEEP should not exceed BLOCK_N");
-static_assert(D_MAX >= 64, "D_MAX should be at least 64 for practical use");
+static_assert(D_MAX >= 64, "D_MAX should be at least 64 for practical use - D_MAX represents the maximum head dimension (embedding size per attention head) supported by this implementation");
 
 // === DEVICE FUNCTION: IN-REGISTER TOP-K INSERTION ===
 // __device__ means this function runs on GPU and can only be called from GPU code
-// inline suggests the compiler should inline this function for performance
+// The 'inline' keyword suggests to the compiler that it should replace calls to this function
+// with the actual function code directly, rather than using a normal function call.
+// This avoids the overhead of function call setup/teardown, which can improve performance,
+// especially for small frequently-called functions. However, the compiler may choose to ignore
+// this suggestion if it determines inlining would not be beneficial.
 __device__ inline void insert_topk(float val,                    // Score value to potentially insert
                                    int idx,                      // Index associated with the score
-                                   float (&vals)[K_KEEP],        // Reference to array of top-K values
+                                   float (&vals)[K_KEEP],        // Reference to array of top-K values  
                                    int (&inds)[K_KEEP]){         // Reference to array of top-K indices
+    // We need both vals and inds arrays because:
+    // - vals stores the actual attention scores that we'll use later for the attention computation
+    // - inds stores which key each score corresponds to (the original position in the sequence)
+    // Without inds, we would know the top-K scores but not which keys produced them
+    // We need both pieces to compute attention: score * value[original_key_position]
+    
     int j = K_KEEP - 1;          // Start from the smallest value in our top-K list
     
     // Shift elements right while val is larger than current element
     while(j >= 0 && val > vals[j]){                             // Compare with current element
         if(j < K_KEEP - 1){                                     // If not at the end of array
-            vals[j+1] = vals[j];                                // Shift value one position right
-            inds[j+1] = inds[j];                                // Shift index one position right
-        }
+            vals[j+1] = vals[j];                                // Shift value one position right, discarding vals[K_KEEP-1]
+            inds[j+1] = inds[j];                                // Shift index one position right, discarding inds[K_KEEP-1]
         --j;                                                    // Move to next position left
     }
     ++j;                                                        // Adjust j to insertion position
@@ -72,8 +87,8 @@ __device__ inline void insert_topk(float val,                    // Score value 
 __device__ void entmax_threshold(const float* s,               // Input scores (sorted descending)
                                 int k,                          // Number of elements in s
                                 float alpha,                    // α parameter for entmax (α > 1)
-                                float* p,                       // Output: entmax probabilities
-                                float &tau,                     // Output: threshold parameter
+                                float* p,                       // Output: entmax probabilities - pointer to array to store probabilities
+                                float &tau,                     // Output: threshold parameter - reference to be modified in-place
                                 bool full){                     // Whether to compute full derivatives
     
     const float inv_am1 = 1.f/(alpha-1.f);                    // Precompute 1/(α-1) for efficiency
@@ -83,13 +98,16 @@ __device__ void entmax_threshold(const float* s,               // Input scores (
     float hi = (alpha-1.f)*s[0];                              // Upper bound (largest score)
     
     // Lambda function to evaluate entmax constraint equation f(τ) = Σp_i - 1
+    // The [&] capture clause means this lambda function captures all variables from the enclosing scope by reference
+    // This allows the lambda to access and modify variables like k, alpha, inv_am1, and s from the outer function
     auto eval = [&](float t,                                   // Current threshold τ
                    float &f,                                   // Output: constraint value f(τ)
                    float&fp,                                   // Output: first derivative f'(τ)  
                    float&fpp){                                 // Output: second derivative f''(τ)
-        f = -1;                                                // Initialize f(τ) = -1 (target is 0)
+        f = -1;                                                // Initialize f(τ) = -1 since we want Σp_i - 1 = 0
+                                                              // We start at -1 and add each p_i in the loop below
+                                                              // When the sum of all p_i equals 1, f will equal 0
         fp = fpp = 0;                                          // Initialize derivatives to zero
-        
         for(int j=0;j<k;++j){                                  // Loop over all scores
             float u = (alpha-1.f)*s[j] - t;                   // Compute u_j = (α-1)s_j - τ
             if(u <= 0) break;                                 // If u_j ≤ 0, p_j = 0, skip rest
@@ -157,7 +175,6 @@ __global__ void build_mask_kernel(
     int nQB,                                                   // Number of query blocks
     int nKB                                                    // Number of key blocks
 ){
-    //test
     // === THREAD AND BLOCK INDEXING ===
     // Each thread processes one query; blockIdx and threadIdx are built-in CUDA variables
     int q = blockIdx.x*BLOCK_M + threadIdx.x;                 // Global query index: block_id * block_size + thread_in_block
@@ -182,6 +199,11 @@ __global__ void build_mask_kernel(
         q_reg[t] = Q[idx*d + t];                              // Load query elements: q_reg[0], q_reg[1], ...
     
     // === INITIALIZE TOP-K BUFFERS ===
+    // These arrays store the top K attention scores and their corresponding key indices
+    // We keep track of the K highest attention scores between this query and all keys
+    // s_top stores the actual attention scores (initialized to -infinity)
+    // ind stores the key indices that produced those scores (initialized to invalid -1)
+    // This allows us to build a sparse attention pattern focusing only on the most relevant keys
     float s_top[K_KEEP];                                       // Top-K attention scores (registers)
     int ind[K_KEEP];                                           // Indices of top-K elements (registers)
     #pragma unroll for(int i=0; i<K_KEEP; ++i){              // Initialize all elements
@@ -190,9 +212,11 @@ __global__ void build_mask_kernel(
     }
     
     // === SHARED MEMORY ALLOCATION ===
-    // extern __shared__ declares dynamic shared memory (allocated at kernel launch)
-    // Shared memory is fast memory shared among all threads in a block
-    extern __shared__ float shmem[];                          // Dynamic shared memory array
+    // Dynamic shared memory is allocated at kernel launch time rather than compile time
+    // This allows the shared memory size to be determined at runtime based on kernel parameters
+    // Shared memory is fast on-chip memory that is shared by all threads within a thread block
+    // It's much faster than global memory but has limited capacity per SM (usually 48-96KB)
+    extern __shared__ float shmem[];                          // Dynamic shared memoryarray
     float* Ktile = shmem;                                     // Use shared memory for key tile
     
     // === TILED PROCESSING OF KEYS ===
@@ -215,7 +239,12 @@ __global__ void build_mask_kernel(
                       K_idx[bh*NK + kn] <= seq_q);           // Causal: key position ≤ query position
             
             // Load key element or zero if out of bounds/causal
-            Ktile[x] = ok ? K[(bh*NK + kn)*d + dim] : 0.f;   // Coalesced memory access
+            Ktile[x] = ok ? K[(bh*NK + kn)*d + dim] : 0.f;   // Load key element if ok, otherwise 0
+                                                             // Formula breakdown:
+                                                             // bh*NK: offset to current batch/head
+                                                             // + kn: offset to current key
+                                                             // *d: multiply by feature dimension
+                                                             // + dim: offset to specific dimension
         }
         
         // === SYNCHRONIZATION ===
@@ -253,7 +282,6 @@ __global__ void build_mask_kernel(
     // Mark which key blocks contain selected top-K elements
     int iQB = q / BLOCK_M;                                    // Which query block this thread belongs to
     int base = bh*nQB*nKB + iQB*nKB;                         // Base address in mask tensor
-    
     for(int i=0; i<K_KEEP; ++i){                            // For each top-K element
         int kn = ind[i];                                      // Global key index
         if(kn < 0) continue;                                  // Skip invalid entries
@@ -274,6 +302,8 @@ __global__ void build_lookup_kernel(
     int* Kj_idx                                               // Output: active query blocks per key [B*H, nQB*nKB]
 ){
     // One thread per batch*head (single threaded within each)
+    // This kernel only needs 1D grid since it processes one batch*head per thread
+    // Unlike the mask kernel which needed 2D grid to parallelize over queries
     int bh = blockIdx.x;                                      // Batch*head index from block ID
     if(bh >= B*H) return;                                    // Bounds check
     

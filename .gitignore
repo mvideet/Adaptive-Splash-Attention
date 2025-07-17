@@ -10,3 +10,6 @@ dist/
 .vscode/
 *.so
 *.pdf
+benchmark/
+source/learning_splash.cu
+source/splash.cu
